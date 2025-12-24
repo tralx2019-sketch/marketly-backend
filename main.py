@@ -13,21 +13,43 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# ========== إعدادات MySQL ==========
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'mysql+pymysql://root:@localhost/marketly_db')
+# ========== إعدادات CORS للسماح بكل المصادر (لتطوير الفرونت إند) ==========
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ========== إعدادات قاعدة البيانات ==========
+# Railway يعطي DATABASE_URL تلقائياً
+DATABASE_URL = os.getenv('DATABASE_URL')
+
+# إذا كان الرابط من Railway (PostgreSQL)
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# الإعداد الافتراضي إذا لم يكن هناك رابط
+if not DATABASE_URL:
+    DATABASE_URL = 'mysql+pymysql://root:@localhost/marketly_db'
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_recycle': 300,
+    'pool_pre_ping': True,
+}
+
+# ========== إعدادات JWT ==========
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'marketly-secret-key-2025')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
 
 # تهيئة الإضافات
-CORS(app)
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
 # Gemini AI
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyA264jNcQX-r85K78ZYi50JGFyBQKysoSY')
-genai.configure(api_key=GOOGLE_API_KEY)
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+else:
+    print("⚠️  تحذير: GOOGLE_API_KEY غير موجود. Gemini AI لن يعمل.")
 
 # ========== تعريف الجداول ==========
 
@@ -38,12 +60,13 @@ class User(db.Model):
     email = db.Column(db.String(100), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    campaigns = db.relationship('Campaign', backref='user', lazy=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    campaigns = db.relationship('Campaign', backref='user', lazy=True, cascade="all, delete-orphan")
 
 class Campaign(db.Model):
     __tablename__ = 'campaigns'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     product_name = db.Column(db.String(200))
     description = db.Column(db.Text)
     target_audience = db.Column(db.String(200))
@@ -52,6 +75,7 @@ class Campaign(db.Model):
     tone = db.Column(db.String(100))
     generated_content = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # ======= إنشاء الجداول ==========
 
@@ -60,11 +84,27 @@ def create_tables():
     try:
         with app.app_context():
             db.create_all()
-            print("✅ تم إنشاء الجداول في قاعدة البيانات MySQL")
+            print(f"✅ تم إنشاء الجداول في قاعدة البيانات")
+            print(f"📊 نوع قاعدة البيانات: {'PostgreSQL' if 'postgresql' in DATABASE_URL else 'MySQL'}")
     except Exception as e:
-        print(f"❌ ياهندسة حصل غلط في إنشاء الجداول: {e}")
+        print(f"❌ حصل غلط في إنشاء الجداول: {e}")
 
 # ======== نقاط النهاية ========
+
+@app.route('/')
+def home():
+    """الصفحة الرئيسية للسيرفر"""
+    return jsonify({
+        "message": "🚀 Marketly AI Backend is running!",
+        "status": "active",
+        "database": "connected" if DATABASE_URL else "not connected",
+        "ai": "ready" if GOOGLE_API_KEY else "not configured",
+        "endpoints": {
+            "auth": ["/auth/register", "/auth/login", "/auth/update"],
+            "campaigns": ["/generate", "/campaigns", "/campaigns/<id>"],
+            "health": "/health"
+        }
+    }), 200
 
 @app.route('/auth/register', methods=['POST'])
 def register():
@@ -75,7 +115,7 @@ def register():
         email = data.get('email')
         password = data.get('password')
         
-        # يا هندسة  متسبنيش أحط بيانات فاضية
+        # يا هندسة متسبنيش أحط بيانات فاضية
         if not name or not email or not password:
             return jsonify({"error": "الاسم والبريد وكلمة السر مطلوبين"}), 400
         
@@ -104,6 +144,7 @@ def register():
         
     except Exception as e:
         db.session.rollback()
+        print(f"❌ خطأ في التسجيل: {e}")
         return jsonify({"error": "عذراً السيرڤر مش شغال دلوقتي"}), 500
 
 @app.route('/auth/login', methods=['POST'])
@@ -138,12 +179,13 @@ def login():
         }), 200
         
     except Exception as e:
+        print(f"❌ خطأ في تسجيل الدخول: {e}")
         return jsonify({"error": "السيرڤر بيقول مش قادر دلوقتي"}), 500
 
 @app.route('/auth/update', methods=['PUT'])
 @jwt_required()
 def update_user():
-    """تحديث بيانات المستخدم - الجديدة دي"""
+    """تحديث بيانات المستخدم"""
     try:
         current_user_id = get_jwt_identity()
         data = request.json
@@ -195,12 +237,13 @@ def update_user():
         
     except Exception as e:
         db.session.rollback()
+        print(f"❌ خطأ في تحديث المستخدم: {e}")
         return jsonify({"error": "مش قادرين نحدث البيانات دلوقتي"}), 500
 
 @app.route('/generate', methods=['POST'])
 @jwt_required(optional=True)
 def generate_content():
-    """توليد محتوى بالذكاء الاصطناعي - PROMPT """
+    """توليد محتوى بالذكاء الاصطناعي"""
     try:
         data = request.json
         product_name = data.get('productName', '')
@@ -213,6 +256,10 @@ def generate_content():
         # يا هندسة مش هنعمل محتوى من غير منتج ووصف
         if not product_name or not description:
             return jsonify({"error": "اسم المنتج والوصف مطلوبان"}), 400
+        
+        # نتأكد إن الـ API key موجود
+        if not GOOGLE_API_KEY:
+            return jsonify({"error": "Google API Key غير متوفر"}), 500
         
         prompt = f"""
         **أنت خبير تسويق رقمي محترف في وكالة إعلانات رائدة.**
@@ -253,47 +300,68 @@ def generate_content():
         """
         
         # نكلم Gemini AI
-        model = genai.GenerativeModel('gemini-flash-latest')
-        response = model.generate_content(prompt)
+        try:
+            model = genai.GenerativeModel('gemini-pro')
+            response = model.generate_content(prompt)
+            ai_content = response.text
+        except Exception as ai_error:
+            print(f"❌ خطأ في Gemini AI: {ai_error}")
+            # محتوى بديل في حالة فشل الـ AI
+            ai_content = f"""
+            🎯 **حملة تسويقية لـ {product_name}**
+            
+            **عرض خاص!** {product_name} يقدم لك تجربة فريدة من نوعها.
+            
+            **المميزات الرئيسية:**
+            • {description}
+            • مناسب لـ {target_audience if target_audience else 'جميع الفئات'}
+            • متوافق مع منصة {platform}
+            
+            **لماذا تختارنا؟**
+            - جودة عالية
+            - سعر مميز
+            - خدمة عملاء على مدار الساعة
+            
+            **تواصل معنا الآن!**
+            
+            #{product_name.replace(' ', '')} #{platform} #تسويق #عرض
+            """
         
-        # لو الرد جه
-        #  نخزنه في الداتابيز
-        if response.text:
-            # تنظيف النص من علامات الاقتباس الزائدة
-            cleaned_text = response.text.strip()
-            cleaned_text = cleaned_text.replace('**', '')  # نزيل علامات البولد الزائدة
-            cleaned_text = cleaned_text.replace('*', '')   # نزيل علامات النجمة
-            
-            current_user_id = get_jwt_identity()
-            if current_user_id:
-                try:
-                    new_campaign = Campaign(
-                        user_id=current_user_id,
-                        product_name=product_name,
-                        description=description,
-                        target_audience=target_audience,
-                        keywords=keywords,
-                        platform=platform,
-                        tone=tone,
-                        generated_content=cleaned_text
-                    )
-                    db.session.add(new_campaign)
-                    db.session.commit()
-                    return jsonify({
-                        "result": cleaned_text,
-                        "campaign_id": new_campaign.id,
-                        "saved": True
-                    })
-                except Exception as db_error:
-                    # لو حصل غلط في الحفظ نرجع المحتوى بس منغير حفظ
-                    return jsonify({"result": cleaned_text, "saved": False})
-            
-            # لو مش مسجل دخول نرجع المحتوى بس
-            return jsonify({"result": cleaned_text, "saved": False})
-        else:
-            return jsonify({"error": "الـ AI مش عارف يكتب حاجة"}), 500
+        # تنظيف النص من علامات الاقتباس الزائدة
+        cleaned_text = ai_content.strip()
+        cleaned_text = cleaned_text.replace('**', '')  # نزيل علامات البولد الزائدة
+        cleaned_text = cleaned_text.replace('*', '')   # نزيل علامات النجمة
+        
+        current_user_id = get_jwt_identity()
+        if current_user_id:
+            try:
+                new_campaign = Campaign(
+                    user_id=current_user_id,
+                    product_name=product_name,
+                    description=description,
+                    target_audience=target_audience,
+                    keywords=keywords,
+                    platform=platform,
+                    tone=tone,
+                    generated_content=cleaned_text
+                )
+                db.session.add(new_campaign)
+                db.session.commit()
+                return jsonify({
+                    "result": cleaned_text,
+                    "campaign_id": new_campaign.id,
+                    "saved": True
+                })
+            except Exception as db_error:
+                # لو حصل غلط في الحفظ نرجع المحتوى بس منغير حفظ
+                print(f"❌ خطأ في حفظ الحملة: {db_error}")
+                return jsonify({"result": cleaned_text, "saved": False})
+        
+        # لو مش مسجل دخول نرجع المحتوى بس
+        return jsonify({"result": cleaned_text, "saved": False})
 
     except Exception as e:
+        print(f"❌ خطأ في توليد المحتوى: {e}")
         return jsonify({"error": f"يا هندسة حصل غلط: {str(e)}"}), 500
 
 @app.route('/campaigns', methods=['GET'])
@@ -321,6 +389,7 @@ def get_campaigns():
         return jsonify(campaigns_list), 200
         
     except Exception as e:
+        print(f"❌ خطأ في جلب الحملات: {e}")
         return jsonify({"error": "مش قادرين نجيب الحملات دلوقتي"}), 500
 
 @app.route('/campaigns/<int:campaign_id>', methods=['DELETE'])
@@ -339,33 +408,85 @@ def delete_campaign(campaign_id):
         
     except Exception as e:
         db.session.rollback()
+        print(f"❌ خطأ في حذف الحملة: {e}")
         return jsonify({"error": "مش قادرين نمسح الحملة دلوقتي"}), 500
+
+@app.route('/campaigns/<int:campaign_id>', methods=['GET'])
+@jwt_required()
+def get_campaign(campaign_id):
+    """جلب حملة واحدة"""
+    try:
+        current_user_id = get_jwt_identity()
+        campaign = Campaign.query.filter_by(id=campaign_id, user_id=current_user_id).first()
+        if not campaign:
+            return jsonify({"error": "مفيش حملة بالرقم ده"}), 404
+        
+        return jsonify({
+            "id": campaign.id,
+            "product_name": campaign.product_name,
+            "description": campaign.description,
+            "target_audience": campaign.target_audience,
+            "keywords": campaign.keywords,
+            "platform": campaign.platform,
+            "tone": campaign.tone,
+            "generated_content": campaign.generated_content,
+            "created_at": campaign.created_at.strftime("%Y-%m-%d %H:%M")
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ خطأ في جلب الحملة: {e}")
+        return jsonify({"error": "مش قادرين نجيب الحملة دلوقتي"}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """فحص صحة السيرفر - عشان نتأكد إنه شغال"""
+    """فحص صحة السيرفر"""
     try:
+        # محاولة الاتصال بقاعدة البيانات
         db.session.execute('SELECT 1')
-        return jsonify({
-            "status": "شغال زي الفل",
-            "database": "MySQL متصل",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }), 200
+        db_status = "متصل"
     except Exception as e:
-        return jsonify({
-            "status": "مش شغال",
-            "database": "MySQL مش متصل"
-        }), 500
+        db_status = f"غير متصل: {str(e)}"
+    
+    try:
+        ai_status = "جاهز" if GOOGLE_API_KEY else "غير مهيأ"
+    except:
+        ai_status = "خطأ"
+    
+    return jsonify({
+        "status": "✅ شغال",
+        "service": "Marketly AI Backend",
+        "database": db_status,
+        "ai": ai_status,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": "1.0.0",
+        "environment": os.getenv('ENVIRONMENT', 'development')
+    }), 200
+
+# ========== معالجة الأخطاء ==========
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "الرابط مش موجود"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "حصل غلط في السيرفر"}), 500
+
+@app.errorhandler(401)
+def unauthorized(error):
+    return jsonify({"error": "مش مسجل دخول"}), 401
 
 # ========== تشغيل التطبيق ==========
 
 if __name__ == '__main__':
     create_tables()
-    print("=" * 50)
-    print("🚀 Marketly AI Server is running on http://localhost:5000")
-    print("📊 Database: MySQL (marketly_db)")
-    print("👤 Test User: test@marketly.com / 123456")
-    print("🆕 Added: /auth/update endpoint for settings")
-    print("✨ IMPROVED: Enhanced AI prompt for better content generation")
-    print("=" * 50)
-    app.run(host='0.0.0.0', port=port)
+    print("=" * 60)
+    print("🚀 Marketly AI Server is starting...")
+    print(f"📊 Database: {DATABASE_URL[:50]}...")
+    print(f"🔑 AI Status: {'Ready' if GOOGLE_API_KEY else 'Not Configured'}")
+    print(f"🌐 CORS: Enabled for all origins")
+    print("=" * 60)
+    
+    # خذ البورت من المتغيرات البيئية أو استخدم 5000
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
