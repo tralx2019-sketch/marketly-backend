@@ -1,0 +1,16 @@
+name: marketly-backend
+services:
+  - name: app
+    type: web
+    ports:
+      - port: 8000
+        http_path: /
+    build:
+      command: pip install -r requirements.txt
+    run:
+      command: gunicorn main:app
+    env:
+      - name: JWT_SECRET_KEY
+        value: marketly-secret-key-koyeb-2025
+      - name: GOOGLE_API_KEY
+        value: AIzaSyA264jNcQX-r85K78ZYi50JGFyBQKysoSY
